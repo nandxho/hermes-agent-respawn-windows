@@ -14,6 +14,13 @@ import threading
 _INTERPRETER_PREFIXES = tuple({
     Path(p).resolve() for p in (sys.prefix, sys.base_prefix, sys.exec_prefix, sys.base_exec_prefix)
 } | {
+    # The same prefixes unresolved. A managed runtime may be reached through a symlink alias
+    # (``cpython-3.11-...`` -> ``cpython-3.11.15-...``) that still sits under the home; check()
+    # refuses a lexical match against a root before it resolves anything, so an interpreter
+    # loaded through the alias must be exempt by name as well — otherwise every failing test in
+    # a checkout outside the home is masked by a guard trip instead of its own traceback.
+    Path(p) for p in (sys.prefix, sys.base_prefix, sys.exec_prefix, sys.base_exec_prefix) if p
+} | {
     # A PM-activated developer shell runs sys.prefix's python against a dependency generation
     # whose site-packages sits under the (real) Hermes home; third-party imports from it are the
     # interpreter's installation, not Hermes state.
