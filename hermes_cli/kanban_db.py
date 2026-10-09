@@ -2622,6 +2622,29 @@ class EmptyCompletionError(ValueError):
         )
 
 
+class PublicationGateError(ValueError):
+    """``complete_task`` refused: the card's work never landed.
+
+    Structural counterpart to the declared-PR contract: a ``worktree`` card whose
+    branch exists only in the local clone. ``missing`` carries one entry per
+    failed check (``branch_published`` / ``merged_pr``) with the exact command
+    that fixes it, so the refusal is actionable. A ``ValueError`` so tool error
+    handlers treat it as recoverable.
+    """
+
+    def __init__(self, task_id: str, receipt: dict):
+        from hermes_cli.kanban_publication_gate import describe_missing
+
+        self.task_id = task_id
+        self.receipt = receipt
+        self.missing = list(receipt.get("missing") or [])
+        detail = describe_missing(receipt)
+        super().__init__(
+            f"completion blocked: {task_id} shows no published branch / merged PR "
+            f"({detail}). {receipt.get('remedy', '')}".strip()
+        )
+
+
 class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
@@ -2685,6 +2708,18 @@ def complete_task(
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
     verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
     _gate_empty_completion(conn, task_id, result=result, summary=summary)
+    from hermes_cli.kanban_publication_gate import evaluate_publication_gate
+
+    publication = evaluate_publication_gate(conn, task_id, force=force)
+    if publication is not None:
+        with write_txn(conn):
+            _append_event(
+                conn, task_id,
+                "publication_gate_forced" if publication.get("forced") else "publication_gate_blocked",
+                publication,
+            )
+        if not publication.get("ok"):
+            raise PublicationGateError(task_id, publication)
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )

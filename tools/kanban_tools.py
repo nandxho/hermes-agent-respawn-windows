@@ -784,6 +784,20 @@ def _handle_complete(args: dict, **kw) -> str:
                 f"kanban_complete blocked: {empty_err}. Your task is still in-flight (no state "
                 f"change). Retry kanban_complete with a non-empty summary or result describing "
                 f"what was done.")
+        except kb.PublicationGateError as pub_err:
+            # Structural counterpart of the declared-PR contract: the worktree card's
+            # work exists only in the local clone. The gate runs before the write txn,
+            # so nothing was mutated and the audit event already landed. Spell out the
+            # fix — a worker that reads this as terminal either blocks or re-does the work.
+            fixes = "; ".join(
+                f"{m['check']}: {m['fix']}" for m in getattr(pub_err, "missing", [])
+            ) or "publish the branch and merge its pull request"
+            return tool_error(
+                f"kanban_complete blocked: {pub_err.task_id} shows no published branch / merged "
+                f"PR. Your task is still in-flight (no state change). Do this, then retry "
+                f"kanban_complete with the same summary: {fixes}. If this card's output is not a "
+                f"branch in the remote (infrastructure, rescue, documentation), ask an operator "
+                f"to exempt it explicitly — the bypass is audited.")
         task = kb.get_task(conn, tid)
         if not ok:
             # complete_task reports every refusal as bare False; a reopened or

@@ -1906,6 +1906,21 @@ DEFAULT_CONFIG = {
         # early failure evidence from long-running workers.
         "worker_log_rotate_bytes": 2 * 1024 * 1024,
         "worker_log_backup_count": 1,
+        # Structural publication gate: refuse to close a `worktree` card whose branch never reached
+        # the remote and whose pull request never merged. Closes the 2026-10-08 hole where five cards
+        # were marked done with their commits living only in the local clone's .git. Only `worktree`
+        # cards are checked (boards are commonly project_id=NULL, so the trigger is structural, never
+        # project-based); `scratch`/`dir` cards and declared OWNER/REPO-or-PR contracts are untouched.
+        # Fails OPEN on anything unverifiable (git/gh missing, remote unreachable) so a broken gate can
+        # never block the whole board; a card whose branch produced no commits is skipped. Exempt a
+        # legitimate non-branch close (infra/rescue/docs) explicitly and auditably — see
+        # kanban_publication_gate.exempt_publication_gate, which refuses a blank reason.
+        "publication_gate": True,
+        # Remote the branch must be published to (`git ls-remote <remote> refs/heads/<branch>`).
+        "publication_gate_remote": "origin",
+        # Optional board-wide OWNER/REPO for the merged-PR check (`gh pr list --repo ...`); "" = read
+        # the slug from each worktree's own remote URL.
+        "publication_gate_repo": "",
         # Profile for the root/orchestration task after Triage decomposition; "" = default profile.
         # Does not control the decomposer LLM path (see auxiliary.kanban_decomposer).
         "orchestrator_profile": "",

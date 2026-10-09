@@ -207,7 +207,7 @@ def _profile_author() -> str:
 
 _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "init", "create", "swarm", "assign", "reclaim", "reassign", "link", "unlink",
-    "claim", "comment", "attach", "attach-rm", "complete", "edit", "block",
+    "claim", "comment", "attach", "attach-rm", "complete", "edit", "block", "exempt",
     "schedule", "unblock", "promote", "archive", "dispatch", "daemon", "repair",
     "heartbeat", "notify-subscribe", "notify-unsubscribe", "specify", "decompose",
     "request-review", "request-changes", "reopen-review",
@@ -892,6 +892,34 @@ def _goal_gate_error(conn, tid: str, evidence: str, handoff: str, blocked_hint: 
     return None
 
 
+def _cmd_exempt(args: argparse.Namespace) -> int:
+    """Exempt a task from the publication gate, explicitly and auditably.
+
+    The exemption is an event on the task log naming the actor and the reason, so
+    a reviewer can always ask why a card closed without a published branch. A
+    blank reason is refused — a silent bypass is exactly what the gate exists to
+    prevent.
+    """
+    from hermes_cli.kanban_publication_gate import exempt_publication_gate
+
+    reason = (getattr(args, "reason", "") or "").strip()
+    if not reason:
+        return _err("kanban: --reason is required and must be non-empty — an exemption "
+                    "without a recorded reason is exactly what the publication gate "
+                    "exists to prevent.", 2)
+    author = getattr(args, "author", None) or _profile_author()
+    with kbc.connect_closing() as conn:
+        if kb.get_task(conn, args.task_id) is None:
+            return _err(f"kanban: unknown task {args.task_id}", 1)
+        exempt_publication_gate(conn, args.task_id, reason=reason, actor=author)
+    if getattr(args, "json", False):
+        print(json.dumps({"task_id": args.task_id, "exempt": True,
+                          "reason": reason, "actor": author}))
+    else:
+        print(f"{args.task_id} exempt from the publication gate (audited): {reason}")
+    return 0
+
+
 def _cmd_complete(args: argparse.Namespace) -> int:
     """Mark one or more tasks done. Supports a single id or a list."""
     ids, rc = _require_ids(args)
@@ -930,6 +958,16 @@ def _cmd_complete(args: argparse.Namespace) -> int:
             except kb.EmptyCompletionError as empty_err:
                 fail_msg[tid] = (f"cannot complete {tid}: {empty_err}. Pass --result/--summary "
                                  f"describing what was done (an empty completion is not evidence).")
+                return False
+            except kb.PublicationGateError as pub_err:
+                fixes = "; ".join(
+                    f"{m['check']}: {m['fix']}" for m in getattr(pub_err, "missing", [])
+                ) or "publish the branch and merge its pull request"
+                fail_msg[tid] = (f"cannot complete {tid}: {pub_err}. Fix it, then retry: {fixes}. "
+                                 f"If this card's output is not a branch in the remote "
+                                 f"(infrastructure, rescue, documentation), run "
+                                 f"`hermes kanban exempt {tid} --reason '...'` to bypass the gate "
+                                 f"explicitly (the exemption is audited).")
                 return False
             if not done:
                 # complete_task returns bare False for a dependency refusal too;
@@ -1327,6 +1365,7 @@ _HANDLERS = {
     "comment": _cmd_comment, "attach": _cmd_attach,
     "attachments": _cmd_attachments, "attach-rm": _cmd_attach_rm,
     "complete": _cmd_complete, "edit": _cmd_edit, "block": _cmd_block,
+    "exempt": _cmd_exempt,
     "schedule": _cmd_schedule, "unblock": _cmd_unblock,
     "request-review": _cmd_request_review, "request-changes": _cmd_request_changes,
     "reopen-review": _cmd_reopen_review, "promote": _cmd_promote,

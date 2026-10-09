@@ -304,6 +304,15 @@ _SPECS = [
              help="Override the live-claim guard: complete a running, claimed task "
                   "even without owning its run (closes the worker's run)."),
     ], help="Mark one or more tasks done"),
+    _cmd("exempt", [
+        _TASK_ID,
+        _arg("--reason", required=True,
+             help="Why this card's output is not a branch in the remote (infrastructure, rescue, "
+                  "documentation). Required and recorded on the task's event log for audit; a "
+                  "blank reason is refused."),
+        _arg("--author", help="Who grants the exemption (default: $HERMES_PROFILE or 'user')"),
+        _json_flag(help="Emit JSON instead of the default human line"),
+    ], help="Exempt a task from the publication gate (explicit and audited)"),
     _cmd("edit", [
         _TASK_ID,
         _arg("--title", help="Replace the task title"),
