@@ -735,13 +735,52 @@ def _board_worktree_target(board: Optional[str], task_id: str) -> Path:
     return _kb.workspaces_root(board=slug) / task_id / "wt"
 
 
+def _legacy_nested_worktree_repo(path: Path) -> Optional[Path]:
+    """Repo whose ``.worktrees/`` directory holds *path*, or ``None``.
+
+    ``<repo>/.worktrees/<id>`` is the pre-26-oct-2026 shape, still persisted in
+    166 rows of the Himex board: materializing it puts the tree INSIDE a working
+    checkout. Any path in that shape is redirected to the board-anchored target,
+    whichever task wrote it (legacy rows and ``project=`` cards both use it).
+    """
+    if path.parent.name != ".worktrees":
+        return None
+    repo_root = _repo_root_for_worktree_target(path.parent)
+    if repo_root is None:
+        return None
+    if _path_key(repo_root / ".worktrees") != _path_key(path.parent.resolve(strict=False)):
+        return None
+    return repo_root
+
+
+def _move_worktree(repo_root: Path, source: Path, target: Path) -> None:
+    """Relocate a linked worktree with ``git worktree move``.
+
+    ``move`` (not remove+add) is what keeps uncommitted work and the branch
+    checkout intact while the tree leaves the checkout.
+    """
+    if _path_key(source) == _path_key(target):
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    result = _git(repo_root, "worktree", "move", str(source), str(target), timeout=120)
+    if result.returncode != 0:
+        stderr = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(
+            f"cannot move worktree {source} out of the checkout to {target}: {stderr}"
+        )
+
+
 def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> tuple[Path, str]:
     """Resolve + materialize a linked git worktree for ``task``. With no
     ``task.workspace_path`` the repo comes from the board's ``default_workdir``
     while the tree itself lands outside the checkout at
     ``<board workspaces root>/<id>/wt`` (never the dispatcher's incidental CWD,
     and never inside the repo being worked on); with no anchor configured we
-    fail loudly rather than guess."""
+    fail loudly rather than guess. A requested path in the legacy
+    ``<repo>/.worktrees/<id>`` shape is redirected to that same board-anchored
+    target (there a task's OWN already-materialized legacy tree is relocated
+    with ``git worktree move``; another card's tree is never hijacked), so no
+    dispatch can re-create a tree inside the checkout."""
     branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
     if not task.workspace_path:
         board_slug = board if board else _kb.get_current_board()
@@ -776,6 +815,23 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
             f"{task.workspace_path!r}; use an absolute path"
         )
     requested_resolved = requested.resolve(strict=False)
+
+    legacy_repo = _legacy_nested_worktree_repo(requested_resolved)
+    if legacy_repo is not None:
+        # Doctrina: ningún árbol vive dentro del checkout. La forma legada
+        # ``<repo>/.worktrees/<id>`` (166 filas del board himex) y las tarjetas
+        # con ``project=`` se resuelven al target anclado al board, y el
+        # dispatcher persiste ese path en la tarjeta (set_workspace_path).
+        slug = board if board else _kb.get_current_board()
+        target = _board_worktree_target(slug, task.id).resolve(strict=False)
+        if requested.name == task.id and requested.exists() and _is_linked_worktree_checkout(requested):
+            # Árbol propio ya materializado en la ubicación vieja: se mueve con
+            # ``git worktree move`` (conserva trabajo sin commitear). Un árbol
+            # ajeno NO se toca: mudarlo es tarea de SU tarjeta, y reclamarlo
+            # aquí sería robarle el checkout a otra tarjeta viva.
+            _move_worktree(legacy_repo, requested_resolved, target)
+        _ensure_git_worktree(legacy_repo, target, branch_name)
+        return target, branch_name
 
     if requested.exists() and _is_linked_worktree_checkout(requested):
         actual_branch = _git_current_branch(requested)

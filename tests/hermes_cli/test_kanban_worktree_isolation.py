@@ -125,6 +125,10 @@ def test_resolve_worktree_falls_back_when_path_occupied(kanban_home, tmp_path):
     assert repo not in workspace.parents
     assert (kanban_home / "kanban") in workspace.parents
     assert branch == f"wt/{tid}"
+    # …and it must be materialized AT the returned path, not merely returned:
+    # asserting the shape alone passes for a resolver that creates the tree
+    # somewhere else.
+    assert (workspace / "README.md").exists()
     # The sibling's checkout is untouched, still on its own branch.
     assert (occupied / "README.md").exists()
     head = subprocess.run(
@@ -132,6 +136,83 @@ def test_resolve_worktree_falls_back_when_path_occupied(kanban_home, tmp_path):
         capture_output=True, text=True, check=True,
     ).stdout.strip()
     assert head == "wt/sibling"
+
+
+def test_legacy_nested_path_is_never_materialized_inside_checkout(kanban_home, tmp_path):
+    """Forma legada ``<repo>/.worktrees/<id>`` (166 filas del board himex).
+
+    Hoy son tarjetas terminales, pero un reintento o reapertura vuelve a
+    pasar por el resolver: sin esta redirección el árbol nace DENTRO de
+    ``04_Desarrollo`` — el síntoma que esta tarjeta existe para cerrar.
+    """
+    repo = _make_repo(tmp_path)
+    legacy = repo / ".worktrees" / "t_legacy01"
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="tarjeta legada",
+            workspace_kind="worktree",
+            workspace_path=str(legacy),
+        )
+        task = kb.get_task(conn, tid)
+
+    assert task is not None
+    workspace, branch = kbw._resolve_worktree_workspace(task)
+
+    assert repo not in workspace.parents
+    assert (kanban_home / "kanban") in workspace.parents
+    assert workspace.name == "wt" and workspace.parent.name == tid
+    # Materializado en el path devuelto, fuera del checkout.
+    assert (workspace / "README.md").exists()
+    assert branch == f"wt/{tid}"
+    # El path legado no existe: nada se creó dentro del repo.
+    assert not legacy.exists()
+    assert not (repo / ".worktrees").exists()
+
+
+def test_existing_legacy_tree_is_moved_out_of_checkout(kanban_home, tmp_path):
+    """Un árbol ya materializado en la forma legada se mueve, no se abandona.
+
+    ``git worktree move`` conserva el trabajo sin commitear: mover no es
+    borrar+recrear.
+    """
+    repo = _make_repo(tmp_path)
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="tarjeta legada con árbol vivo",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        legacy = repo / ".worktrees" / tid
+        conn.execute(
+            "UPDATE tasks SET workspace_path = ? WHERE id = ?", (str(legacy), tid)
+        )
+        conn.commit()
+        task = kb.get_task(conn, tid)
+
+    _add_worktree(repo, legacy, f"wt/{tid}")
+    (legacy / "wip.txt").write_text("trabajo sin commitear\n", encoding="utf-8")
+
+    assert task is not None
+    workspace, branch = kbw._resolve_worktree_workspace(task)
+
+    assert repo not in workspace.parents
+    assert workspace.name == "wt" and workspace.parent.name == tid
+    assert branch == f"wt/{tid}"
+    # El árbol se movió con su contenido intacto.
+    assert (workspace / "README.md").exists()
+    assert (workspace / "wip.txt").read_text(encoding="utf-8") == "trabajo sin commitear\n"
+    assert not legacy.exists()
+    # git ya no lo registra dentro del checkout.
+    listed = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert str(legacy) not in listed
+    assert str(workspace) in listed
 
 
 def test_new_worktree_bases_on_trunk_not_checkout_head(kanban_home, tmp_path):

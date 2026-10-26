@@ -763,25 +763,36 @@ def test_delete_task_removes_task_and_cascades(kanban_home):
 
 
 
-def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_home, tmp_path):
+def test_worktree_workspace_explicit_legacy_target_redirects_outside_checkout(kanban_home, tmp_path):
+    """Un target explícito en la forma ``<repo>/.worktrees/<id>`` se redirige.
+
+    Antes se materializaba tal cual (dentro del checkout). La doctrina del
+    26-oct-2026 es que ningún árbol viva dentro del repo, así que el resolver
+    devuelve el target anclado al board —materializado— y el path pedido no
+    se crea.
+    """
     repo = tmp_path / "repo"
     _init_git_repo(repo)
-    target = repo / ".worktrees" / "custom-task"
+    requested = repo / ".worktrees" / "custom-task"
     branch = "wt/custom-task"
     with kbc.connect() as conn:
         t = kb.create_task(
             conn,
             title="ship",
             workspace_kind="worktree",
-            workspace_path=str(target),
+            workspace_path=str(requested),
             branch_name=branch,
         )
         task = kb.get_task(conn, t)
         assert task is not None
         ws = kbw.resolve_workspace(task)
 
-    assert ws == target
+    assert ws != requested
+    assert repo not in ws.parents
+    assert ws.name == "wt" and ws.parent.name == t
     assert ws.exists()
+    assert (ws / "README.md").exists()
+    assert not requested.exists()
     repo_common = subprocess.run(
         ["git", "-C", str(repo), "rev-parse", "--path-format=absolute", "--git-common-dir"],
         check=True,
@@ -801,8 +812,9 @@ def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_
         capture_output=True,
         text=True,
     ).stdout
-    assert f"worktree {target}" in listed
+    assert f"worktree {ws}" in listed
     assert f"branch refs/heads/{branch}" in listed
+    assert f"worktree {requested}" not in listed
 
 
 # ---------------------------------------------------------------------------

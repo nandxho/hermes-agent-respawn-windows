@@ -1078,8 +1078,11 @@ def _project_from_source_task(
     worktree task on this board. Worker profiles have their own projects.db
     while the Kanban DB is shared, so this carries the repo + branch
     convention forward without opening the creator's store and without
-    reusing the source task's literal worktree path. ``(None, None)`` when
-    the source task is not a ``<repo>/.worktrees/<id>`` project worktree."""
+    reusing the source task's literal worktree path. Accepts both shapes:
+    the legacy ``<repo>/.worktrees/<id>`` birth marker and the board-anchored
+    ``<board>/workspaces/<id>/wt`` the dispatcher persists after resolving
+    (there the repo is read back from the worktree's git common dir).
+    ``(None, None)`` when the source task is neither."""
     source_task = get_task(conn, source_task_id)
     if not (
         source_task is not None
@@ -1089,11 +1092,17 @@ def _project_from_source_task(
     ):
         return None, None
     source_path = Path(source_task.workspace_path)
-    if not (
+    legacy_shape = (
         source_path.is_absolute()
         and source_path.name == source_task.id
         and source_path.parent.name == ".worktrees"
-    ):
+    )
+    anchored_shape = (
+        source_path.is_absolute()
+        and source_path.name == "wt"
+        and source_path.parent.name == source_task.id
+    )
+    if not (legacy_shape or anchored_shape):
         return None, None
     project_slug = None
     if source_task.branch_name:
@@ -1106,7 +1115,19 @@ def _project_from_source_task(
             project_slug = _pdb.normalize_slug(project_id)
     if not project_slug:
         return None, None
-    project_repo = str(source_path.parent.parent)
+    project_repo = None
+    if legacy_shape:
+        project_repo = str(source_path.parent.parent)
+    else:
+        # Board-anchored tree: recover the project repo from the worktree's
+        # own git common dir instead of from the path shape.
+        common_dir = _git_out(
+            source_path, "rev-parse", "--path-format=absolute", "--git-common-dir"
+        )
+        if common_dir:
+            project_repo = str(Path(common_dir).parent)
+    if not project_repo:
+        return None, None
     project_obj = _pdb.Project(
         id=project_id, slug=project_slug, name=project_slug, created_at=0, primary_path=project_repo,
     )
@@ -1253,6 +1274,15 @@ def create_task(
                 # branch, instead of the random ``wt/<id>`` worker fallback.
                 if project_obj is not None and workspace_kind == "worktree":
                     if project_repo and not workspace_path:
+                        # Legacy-shaped *marker* only: nothing is ever created
+                        # at this path. The dispatcher's resolver redirects any
+                        # ``<repo>/.worktrees/<id>`` to the board-anchored
+                        # ``<board>/workspaces/<id>/wt`` and persists that path
+                        # on the card (kanban_db_workspace._resolve_worktree_workspace),
+                        # so a project worktree never materializes inside the
+                        # checkout; the pair (marker, project id + branch) is
+                        # also what _project_from_source_task recovers a repo
+                        # from on cross-profile boards.
                         workspace_path = os.path.join(project_repo, ".worktrees", task_id)
                     if not branch_name:
                         branch_name = _project_branch_name(project_obj, task_id, title)
