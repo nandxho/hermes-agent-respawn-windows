@@ -8,7 +8,7 @@ one directory on one branch (cross-task provenance corruption, no lock).
 
 Two-part fix under test:
 - ``decompose_triage_task`` leaves worktree children's ``workspace_path``
-  unset so each child materializes its own ``<repo>/.worktrees/<child-id>``.
+  unset so each child materializes its own ``<board-root>/workspaces/<id>/wt``.
 - ``_resolve_worktree_workspace`` falls back to a fresh per-task worktree
   when the requested path is occupied by another task's branch (heals
   pre-existing rows that still carry a shared path).
@@ -118,7 +118,12 @@ def test_resolve_worktree_falls_back_when_path_occupied(kanban_home, tmp_path):
         task = kb.get_task(conn, tid)
 
     workspace, branch = kbw._resolve_worktree_workspace(task)
-    assert workspace == (repo / ".worktrees" / tid).resolve()
+    # The fallback tree must live OUTSIDE the checkout (25-oct-2026: nested
+    # ``<repo>/.worktrees/*`` trees cost 5.7 GB and hid from `git status`).
+    assert workspace.name == "wt"
+    assert workspace.parent.name == tid
+    assert repo not in workspace.parents
+    assert (kanban_home / "kanban") in workspace.parents
     assert branch == f"wt/{tid}"
     # The sibling's checkout is untouched, still on its own branch.
     assert (occupied / "README.md").exists()
@@ -128,6 +133,48 @@ def test_resolve_worktree_falls_back_when_path_occupied(kanban_home, tmp_path):
     ).stdout.strip()
     assert head == "wt/sibling"
 
+
+def test_new_worktree_bases_on_trunk_not_checkout_head(kanban_home, tmp_path):
+    """Una tarjeta nueva nace del tronco, no de lo que tenga el checkout.
+
+    26-oct-2026: el checkout principal estaba en la rama de otra tarjeta
+    (``feat/ui-portal-activacion-t_d0a95663``), así que el worktree de una
+    tarjeta recién creada heredaba ese trabajo sin mergear y lo habría
+    arrastrado a su PR.
+    """
+    repo = _make_repo(tmp_path)
+    trunk_sha = subprocess.run(
+        ["git", "-C", str(repo), "rev-parse", "HEAD"],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    _git(repo, "update-ref", "refs/remotes/origin/main", trunk_sha)
+
+    # Otra tarjeta deja el checkout compartido en su rama, con un commit propio.
+    _git(repo, "checkout", "-b", "feat/otra-tarjeta")
+    (repo / "otra.txt").write_text("trabajo sin mergear\n", encoding="utf-8")
+    _git(repo, "add", "otra.txt")
+    _git(repo, "commit", "-m", "wip de otra tarjeta")
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="tarjeta nueva",
+            workspace_kind="worktree",
+            workspace_path=str(repo),  # el dispatcher rellena el repo, no el árbol
+        )
+        task = kb.get_task(conn, tid)
+
+    assert task is not None
+    workspace, _ = kbw._resolve_worktree_workspace(task)
+
+    def _head(path: Path) -> str:
+        return subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "HEAD"],
+            capture_output=True, text=True, check=True,
+        ).stdout.strip()
+
+    assert _head(workspace) == trunk_sha
+    assert not (workspace / "otra.txt").exists()
 
 
 

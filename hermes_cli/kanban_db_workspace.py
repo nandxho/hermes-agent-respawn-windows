@@ -686,6 +686,22 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
+def _trunk_base(repo_root: Path) -> str:
+    """Ref nuevo-worktree se basa en: `origin/main` > `main` > `HEAD`.
+
+    Nunca se usa `HEAD` a secas cuando hay tronco: el checkout principal puede
+    estar en la rama de **otra** tarjeta (pasó el 26-oct-2026: el árbol
+    principal estaba en `feat/ui-portal-activacion-t_d0a95663`, así que un
+    worktree nuevo nacía con el trabajo sin mergear de ese carril y lo habría
+    arrastrado a su PR).
+    """
+    for ref in ("origin/main", "main"):
+        result = _git(repo_root, "rev-parse", "--verify", "--quiet", f"{ref}^{{commit}}", timeout=30)
+        if result.returncode == 0 and (result.stdout or "").strip():
+            return ref
+    return "HEAD"
+
+
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
     """Materialize ``target`` as a linked git worktree under ``repo_root``."""
     target = target.expanduser()
@@ -696,7 +712,7 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
     if _git_branch_exists(repo_root, branch_name):
         args = ["worktree", "add", str(target), branch_name]
     else:
-        args = ["worktree", "add", "-b", branch_name, str(target), "HEAD"]
+        args = ["worktree", "add", "-b", branch_name, str(target), _trunk_base(repo_root)]
     result = _git(repo_root, *args, timeout=60)
     if result.returncode != 0:
         stderr = (result.stderr or result.stdout or "").strip()
@@ -705,19 +721,27 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         )
 
 
-def _anchored_worktree(repo_root: Path, task_id: str, branch_name: str) -> tuple[Path, str]:
-    """Materialize the canonical ``<repo>/.worktrees/<task-id>`` worktree."""
-    target = repo_root / ".worktrees" / task_id
-    _ensure_git_worktree(repo_root, target, branch_name)
-    return target, branch_name
+def _board_worktree_target(board: Optional[str], task_id: str) -> Path:
+    """``<board workspaces root>/<task-id>/wt`` — where a dispatched worktree lands.
+
+    Board-anchored worktrees deliberately live OUTSIDE the repo checkout. Trees
+    nested as ``<repo>/.worktrees/<id>`` sit inside a working checkout: they cost
+    GBs (measured 25-oct-2026: 5.7 GB of them on the Himex board) and are
+    invisible to the checkout's own ``git status``, so they are easy to forget.
+    The board's ``default_workdir`` still supplies the repo to
+    ``git worktree add`` from; only the tree's location moves.
+    """
+    slug = board if board else _kb.get_current_board()
+    return _kb.workspaces_root(board=slug) / task_id / "wt"
 
 
 def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> tuple[Path, str]:
     """Resolve + materialize a linked git worktree for ``task``. With no
-    ``task.workspace_path`` the anchor is the board's ``default_workdir`` so
-    every worktree lands under a board-owned repo (``<repo>/.worktrees/<id>``)
-    instead of the dispatcher's incidental CWD (whatever dir the gateway was
-    launched from); with no anchor configured we fail loudly rather than guess."""
+    ``task.workspace_path`` the repo comes from the board's ``default_workdir``
+    while the tree itself lands outside the checkout at
+    ``<board workspaces root>/<id>/wt`` (never the dispatcher's incidental CWD,
+    and never inside the repo being worked on); with no anchor configured we
+    fail loudly rather than guess."""
     branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
     if not task.workspace_path:
         board_slug = board if board else _kb.get_current_board()
@@ -741,7 +765,9 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
                 f"task {task.id} has workspace_kind=worktree but board "
                 f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
             )
-        return _anchored_worktree(repo_root, task.id, branch_name)
+        target = _board_worktree_target(board_slug, task.id)
+        _ensure_git_worktree(repo_root, target, branch_name)
+        return target, branch_name
 
     requested = Path(task.workspace_path).expanduser()
     if not requested.is_absolute():
@@ -762,7 +788,9 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
         # unsafe under concurrency — so fall back to our own worktree.
         fallback_root = _repo_root_for_worktree_target(requested.parent)
         if fallback_root is not None:
-            fallback = fallback_root / ".worktrees" / task.id
+            fallback = _board_worktree_target(
+                board if board else _kb.get_current_board(), task.id
+            )
             if _path_key(fallback.resolve(strict=False)) != _path_key(requested_resolved):
                 _ensure_git_worktree(fallback_root, fallback, branch_name)
                 return fallback.resolve(strict=False), branch_name
@@ -772,7 +800,9 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
 
     repo_root = _git_toplevel(requested)
     if repo_root is not None and _path_key(requested_resolved) == _path_key(repo_root):
-        return _anchored_worktree(repo_root, task.id, branch_name)
+        target = _board_worktree_target(board if board else _kb.get_current_board(), task.id)
+        _ensure_git_worktree(repo_root, target, branch_name)
+        return target, branch_name
 
     repo_root = _repo_root_for_worktree_target(requested.parent)
     if repo_root is None:
@@ -791,8 +821,9 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     dispatcher and every profile worker. ``dir``: ``workspace_path``, created
     if missing; MUST be absolute (relative paths would resolve against the
     dispatcher's CWD — confused-deputy traversal). ``worktree``: a linked git
-    worktree; a repo-root ``workspace_path`` anchors ``<repo>/.worktrees/<id>``,
-    a concrete path is created/reused, none -> the board's ``default_workdir``
+    worktree; a repo-root ``workspace_path`` anchors the tree OUTSIDE the
+    checkout at ``<board-root>/workspaces/<id>/wt``, a concrete path is
+    created/reused, none -> the board's ``default_workdir`` supplies the repo
     (raises if unset rather than guessing). Persist via ``set_workspace_path``.
     """
     kind = task.workspace_kind or "scratch"

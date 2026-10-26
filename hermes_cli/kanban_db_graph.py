@@ -178,7 +178,7 @@ def _insert_decomposed_child(
     root's worktree) and NEVER for worktrees — siblings dispatch concurrently
     and one shared checkout would put them all on the first sibling's branch
     with no lock; leaving it unset makes dispatch materialize a fresh
-    ``<repo>/.worktrees/<child-id>`` per child from the board anchor.
+    ``<board-root>/workspaces/<child-id>/wt`` per child from the board anchor.
     """
     from hermes_cli.kanban_db import (
         _new_task_id, _canonical_assignee, _append_event,

@@ -53,8 +53,13 @@ def test_path_key_ignores_unicode_form():
 
 
 @pytest.mark.platforms("macos")
-def test_nfc_workspace_path_resolves_against_nfd_repo_root(tmp_path):
+def test_nfc_workspace_path_resolves_against_nfd_repo_root(tmp_path, monkeypatch):
     """A task row in NFC form resolves on macOS, where git reports NFD."""
+    # The worktree lands under the board workspaces root — keep it inside the
+    # test's tmp tree so nothing is written to the real ~/.hermes.
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
     repo = tmp_path / _nfd("repo-Persönlich")
     repo.mkdir()
     assert _git(repo.parent, "init", "-b", "main", str(repo)).returncode == 0
@@ -74,8 +79,9 @@ def test_nfc_workspace_path_resolves_against_nfd_repo_root(tmp_path):
 
     resolved, _branch = kbw._resolve_worktree_workspace(_Task())
 
-    expected = repo / ".worktrees" / "t_unicode_probe"
+    expected = kbw._board_worktree_target(None, "t_unicode_probe")
     assert expected.is_dir()
+    assert repo not in expected.parents
     assert _nfc(str(Path(resolved).resolve(strict=False))) == _nfc(
         str(expected.resolve(strict=False))
     )
