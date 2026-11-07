@@ -918,6 +918,19 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                 fail_msg[tid] = gate_err
                 return False
             fail_msg[tid] = f"cannot complete {tid} (unknown id or terminal state)"
+            _row = conn.execute("SELECT status FROM tasks WHERE id = ?", (tid,)).fetchone()
+            if _row is not None:
+                # Name the blocker: "unknown id or terminal state" sent operators
+                # looking for a bug when the real answer was "this column has no
+                # completion path" (triage, t_b7d6b063, 07-nov-2026).
+                _st = _row["status"]
+                _hint = ""
+                if _st == "scheduled":
+                    _hint = "; a parked card is freed with `kanban promote`"
+                elif _st == "triage":
+                    _hint = ("; only done/ready/blocked/review/running complete — "
+                             "promote it to ready first if the work is not done yet")
+                fail_msg[tid] = f"cannot complete {tid} (status {_st!r} has no completion path{_hint})"
             try:
                 done = kb.complete_task(conn, tid, result=args.result, summary=summary, metadata=metadata,
                                         expected_run_id=_worker_run_id_for(tid),

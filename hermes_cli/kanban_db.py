@@ -2643,10 +2643,13 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True, force: bool = False,
 ) -> bool:
-    """``running|ready|blocked|review -> done``; records ``result``.
+    """``running|ready|blocked|review|triage -> done``; records ``result``.
 
     ``ready`` is accepted for manual CLI completion, ``review`` for human
-    approval. A ``running`` task under a live claim is only completed with
+    approval, ``triage`` for a decision card whose question is already
+    answered — without it a fulfilled ``triage`` card could only be archived,
+    which erases the difference between "done" and "discarded" (measured
+    07-nov-2026 on t_b7d6b063, five parents ``done``, goal already met). A ``running`` task under a live claim is only completed with
     proof of ownership (``expected_run_id``) or ``force=True`` (explicit
     operator override) — otherwise :class:`LiveClaimError`, the same fence
     :func:`request_review` applies. With no active run the handoff fields survive via
@@ -2699,10 +2702,11 @@ def complete_task(
                        claim_lock   = NULL,
                        claim_expires= NULL,
                        worker_pid   = NULL,
+                       worker_started_at = NULL,
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked', 'review')
+                   AND status IN ('running', 'ready', 'blocked', 'review', 'triage')
                 """
         params: tuple = (result, now, task_id)
         if expected_run_id is not None:
@@ -3475,21 +3479,44 @@ def request_changes(
     return True, implementer
 
 
+# Columns ``promote`` may lift into the dispatchable lane. ``todo``/``blocked``
+# are the historical pair; ``scheduled`` and ``triage`` are the two columns a
+# card could enter but never leave by CLI (measured 07-nov-2026: ``t_2235fc5f``
+# stranded five days in ``scheduled`` under a dead worker — ``promote`` said
+# "only applies to 'todo' or 'blocked'", ``reclaim`` said "not running",
+# ``edit`` has no ``--status`` — and ``t_b7d6b063`` in ``triage`` with its five
+# parents ``done`` and nothing left to decide). Archive was the only exit, and
+# archiving erases the difference between "done" and "discarded".
+PROMOTABLE_STATUSES = ("todo", "blocked", "scheduled", "triage")
+# Leaving these two means overriding a phase the kernel normally owns, so the
+# operator has to say why; the reason lands on the audit event.
+PROMOTION_REQUIRES_REASON = ("scheduled", "triage")
+
+
 def promote_task(
     conn: sqlite3.Connection, task_id: str, *, actor: str, reason: Optional[str] = None,
     dry_run: bool = False,
 ) -> tuple[bool, Optional[str]]:
-    """Operator promotion ``todo``/``blocked`` -> ``ready`` with an audit event.
-    Refused while a parent is unfinished; ``dry_run`` only validates.
-    Returns ``(ok, reason)``."""
+    """Operator promotion ``todo``/``blocked``/``scheduled``/``triage`` ->
+    ``ready`` with an audit event. Refused while a parent is unfinished;
+    ``scheduled``/``triage`` additionally require a ``reason``. ``dry_run``
+    only validates. Returns ``(ok, reason)``."""
     cur_status = _task_status(conn, task_id)
     if cur_status is None:
         return False, f"task {task_id} not found"
 
-    if cur_status not in ("todo", "blocked"):
+    if cur_status not in PROMOTABLE_STATUSES:
         return False, (
             f"task {task_id} is {cur_status!r}; promote only applies to "
-            f"'todo' or 'blocked'"
+            f"'todo', 'blocked', 'scheduled' or 'triage'"
+        )
+
+    reason = (reason or "").strip() or None
+    if cur_status in PROMOTION_REQUIRES_REASON and reason is None:
+        return False, (
+            f"task {task_id} is {cur_status!r}: promoting out of that column needs "
+            f"an audited reason — re-run with one, e.g. `hermes kanban promote "
+            f"{task_id} \"<por qué la devuelvo a ready>\"`"
         )
 
     # No override: claim_task demotes ready -> todo on an undone parent whichever
@@ -3513,13 +3540,29 @@ def promote_task(
         return True, None
 
     with write_txn(conn):
+        sets = "status = 'ready'"
+        if cur_status == "scheduled":
+            # schedule_task clears claim_lock/claim_expires/worker_pid but NOT
+            # worker_started_at, so a parked card keeps the dead run's start
+            # time — the very fingerprint the engine uses to detect a
+            # sequestered card. Close the leaked run and wipe the worker
+            # columns, otherwise the freed card still reads as "a worker is on
+            # it" (the five-day stranding of t_2235fc5f).
+            _reclaim_dangling_run(
+                conn, task_id, statuses=("scheduled",), now=int(time.time()),
+                note="invariant recovery on promote",
+            )
+            sets += ", worker_pid = NULL, worker_started_at = NULL, current_run_id = NULL"
         upd = conn.execute(
-            "UPDATE tasks SET status = 'ready' "
-            "WHERE id = ? AND status IN ('todo', 'blocked')", (task_id,),
+            f"UPDATE tasks SET {sets} "
+            "WHERE id = ? AND status = ?", (task_id, cur_status),
         )
         if upd.rowcount != 1:
             return False, f"task {task_id} status changed during promotion"
-        _append_event(conn, task_id, "promoted_manual", {"actor": actor, "reason": reason})
+        _append_event(
+            conn, task_id, "promoted_manual",
+            {"actor": actor, "reason": reason, "from_status": cur_status},
+        )
 
     return True, None
 
@@ -3580,8 +3623,12 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         # unbounded; only complete_task clears them. ``consecutive_failures``
         # (the dispatcher's spawn/crash counter) IS reset — a deliberate unblock
         # is a fresh start for the retry budget.
+        # ``worker_pid``/``worker_started_at`` are wiped together with the run
+        # they belonged to: leaving them behind is what kept a freed
+        # ``scheduled`` card reading as "a worker is on it" (t_2235fc5f).
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
+            "worker_pid = NULL, worker_started_at = NULL, "
             "consecutive_failures = 0, last_failure_error = NULL "
             "WHERE id = ? AND status IN ('blocked', 'scheduled')", (new_status, task_id),
         )

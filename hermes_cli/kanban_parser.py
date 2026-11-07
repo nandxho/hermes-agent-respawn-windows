@@ -349,11 +349,14 @@ _SPECS = [
     ], help="Send one or more review tasks back for changes (review -> ready/todo)"),
     _cmd("promote", [
         _TASK_ID,
-        _arg("reason", nargs="*", help="Audit-trail reason (recorded on the task_events row)"),
+        _arg("reason", nargs="*",
+             help="Audit-trail reason (recorded on the task_events row). Required for "
+                  "scheduled/triage promotions; optional for todo/blocked."),
         _bulk_ids("promote"),
         _arg("--dry-run", action="store_true", help="Validate the promotion without mutating state"),
         _arg("--json", dest="json", action="store_true", help="Emit machine-readable JSON result"),
-    ], help="Manually move one or more todo/blocked tasks to ready (recovery path)"),
+    ], help="Move todo/blocked/scheduled/triage tasks to ready (recovery path; the only "
+            "CLI exit from scheduled and triage)"),
     _cmd("archive", [
         _arg("task_ids", nargs="*", help="Task ids to archive (default mode)"),
         _arg("--rm", dest="purge_ids", nargs="+",
