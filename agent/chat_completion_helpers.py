@@ -3811,12 +3811,24 @@ class _StreamingCall(StreamingWaitMonitor):
         still be unwinding SSL BIOs (FD-recycle corruption); the OpenAI primary
         is replaced lazily."""
         _est_ctx = estimate_request_context_tokens(self.api_kwargs)
+        _provider = str(getattr(self.agent, "provider", "") or "unknown")
+        # The poll loop re-evaluates this deadline every 0.3s, so anything materially past the
+        # threshold means the monitor THREAD did not run (starved by a blocking call on this
+        # path, or the interpreter was descheduled) — say so instead of implying the kill was
+        # merely late, which cost hours of "why 3019s against a 600s threshold" debugging.
+        _overshoot = max(0.0, elapsed - float(self._stream_stale_timeout or 0.0))
+        _starved = (f" Monitor thread starved {_overshoot:.0f}s past the deadline (it polls every "
+                    f"0.3s, so the delay is a blocked monitor thread, not the provider)."
+                    if _overshoot > 1.0 else "")
         logger.warning(
-            "Stream stale for %.0fs (threshold %.0fs) — no chunks received. model=%s context=~%s tokens. Killing connection.",
-            elapsed, self._stream_stale_timeout, self.api_kwargs.get("model", "unknown"), f"{_est_ctx:,}",
+            "Stream stale for %.0fs (threshold %.0fs) — no chunks received. provider=%s model=%s "
+            "context=~%s tokens. Killing connection.%s",
+            elapsed, self._stream_stale_timeout, _provider,
+            self.api_kwargs.get("model", "unknown"), f"{_est_ctx:,}", _starved,
         )
         self.agent._buffer_diagnostic_status(
-            f"⚠️ No response from provider for {int(elapsed)}s (model: {self.api_kwargs.get('model', 'unknown')}, "
+            f"⚠️ No response from provider {_provider} for {int(elapsed)}s "
+            f"(model: {self.api_kwargs.get('model', 'unknown')}, "
             f"context: ~{_est_ctx:,} tokens). Reconnecting...")
         # Captured BEFORE the cancel/abort: the pool sweep can miss a checked-out
         # connection, so shut down the killed attempt's own socket too — still

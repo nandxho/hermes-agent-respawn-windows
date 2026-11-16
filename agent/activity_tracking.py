@@ -25,6 +25,55 @@ def _activity_lock(obj) -> threading.Lock:
     return _lock
 
 
+# ── Kanban heartbeat bridge ───────────────────────────────────────────────────
+# The bridge writes to the shared board DB, and a WAL write-txn convoy there parks a
+# writer for the whole busy-timeout chain (``kanban_db_connect.write_txn``: 6 x 120s).
+# Run inline, that wait landed on whichever thread called ``_touch_activity`` — including
+# the stream-monitor thread that enforces the stale kill, and the worker thread whose
+# activity clock feeds the gateway turn-liveness watchdog. Both then fired minutes late
+# (stale kill at 5x the threshold, then a wave of "liveness watchdog" aborts on workers
+# that were perfectly healthy). Off-thread + single-flight keeps every caller's clock and
+# deadline honest; the bridge still lands within one 30s monitor tick.
+_bridge_state_lock = threading.Lock()
+_bridge_inflight = False
+
+
+def _run_kanban_bridge(agent) -> None:
+    """Bridge one activity touch into the board. Never raises; always frees the slot."""
+    global _bridge_inflight
+    try:
+        with suppress(Exception):  # never let board I/O break the agent loop
+            from tools.kanban_tools import (
+                heartbeat_current_worker_from_env, inject_new_comments_from_env
+            )
+            heartbeat_current_worker_from_env()
+            # Fold new operator notes into the running turn (OUT-OF-BAND steer).
+            inject_new_comments_from_env(agent)
+    finally:
+        with _bridge_state_lock:
+            _bridge_inflight = False
+
+
+def _bridge_kanban_off_thread(agent) -> None:
+    """Fire-and-forget the board bridge so no agent thread ever waits on the board.
+
+    Single-flight: a slow board coalesces touches instead of growing a thread per touch.
+    """
+    global _bridge_inflight
+    with _bridge_state_lock:
+        if _bridge_inflight:
+            return
+        _bridge_inflight = True
+    try:
+        # Contextvars must survive the hop (kanban tools read the board/profile scope).
+        from agent.memory_provider import spawn_context_thread
+        spawn_context_thread(
+            _run_kanban_bridge, name="kanban-activity-bridge", args=(agent,)).start()
+    except Exception:  # thread start refused (interpreter shutdown): keep the slot clean
+        with _bridge_state_lock:
+            _bridge_inflight = False
+
+
 class ActivityTrackingMixin:
     """Liveness timestamps/labels and rate-limited session activity persistence."""
 
@@ -72,14 +121,9 @@ class ActivityTrackingMixin:
             # itself at the final mutation edge.
             self._turn_liveness_abort_claim = None
         if os.environ.get("HERMES_KANBAN_TASK"):
-            # Never let the bridge break the loop; this guard covers import-time failures.
-            with suppress(Exception):
-                from tools.kanban_tools import (
-                    heartbeat_current_worker_from_env, inject_new_comments_from_env
-                )
-                heartbeat_current_worker_from_env()
-                # Fold new operator notes into the running turn (OUT-OF-BAND steer).
-                inject_new_comments_from_env(self)
+            # Board I/O off-thread: this runs on the stream-monitor thread every 30s, and a
+            # wedged board would otherwise eat the stale-kill deadline (see the bridge block).
+            _bridge_kanban_off_thread(self)
         if force_persist or is_terminal_compression_provenance(resolved_provenance):
             # A terminal compression stamp must land durably NOW. The heartbeat wrote "context compression
             # in progress" moments ago, so deferring this write to the next 60s window leaves the durable
