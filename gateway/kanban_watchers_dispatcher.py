@@ -13,7 +13,7 @@ import sqlite3
 import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from gateway.kanban_watchers_common import _board_slugs, _positive_int_setting, logger
 
@@ -32,7 +32,7 @@ _CORRUPT_DB_MARKERS = ("file is not a database", "database disk image is malform
 
 @dataclass
 class _DispatcherSettings:
-    """``kanban.*`` dispatch settings, read once at boot (restart to apply)."""
+    """``kanban.*`` dispatch settings (re-resolved every tick — see ``refresh_settings``)."""
 
     interval: float
     max_spawn: Any
@@ -44,8 +44,28 @@ class _DispatcherSettings:
     max_in_progress_per_profile: Optional[int]
 
 
-def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettings:
-    """Parse and log the dispatcher settings in their established order."""
+# Knobs an operator can retune while the gateway runs; a change is logged with
+# its before/after so the reload is visible in the log.
+RELOADABLE_SETTINGS = (
+    "interval",
+    "max_spawn",
+    "max_in_progress",
+    "failure_limit",
+    "stale_timeout_seconds",
+    "reconcile_orphans",
+    "default_assignee",
+    "max_in_progress_per_profile",
+)
+
+
+def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any, *, quiet: bool = False) -> _DispatcherSettings:
+    """Parse and log the dispatcher settings in their established order.
+
+    ``quiet`` suppresses the informational echoes (used by the per-tick reload,
+    where re-announcing an unchanged value every minute would drown the log);
+    the reload logs its own before/after line and warnings stay on.
+    """
+    _log_info = logger.info if not quiet else (lambda *a, **kw: None)
     try:
         interval = float(kanban_cfg.get("dispatch_interval_seconds", 60) or 60)
     except (ValueError, TypeError):
@@ -56,15 +76,25 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
 
     max_spawn = kanban_cfg.get("max_spawn")
     if max_spawn is not None:
-        logger.info("kanban dispatcher: max_spawn=%s", max_spawn)
+        _log_info("kanban dispatcher: max_spawn=%s", max_spawn)
 
     # Cap simultaneously running tasks so slow workers don't pile up and time
-    # out. Explicit config wins; otherwise a memory-derived default (unbounded
-    # fan-out swap-thrashes small hosts), or None where total memory can't be read.
+    # out. Explicit config wins; a profile section without the key inherits the
+    # ROOT home's value (profile configs are not deep-merged with the root, so
+    # three profiles silently ran unbounded that way); otherwise a
+    # memory-derived default (unbounded fan-out swap-thrashes small hosts).
+    # Never None — see derive_default_max_in_progress().
     max_in_progress = _positive_int_setting(kanban_cfg, "max_in_progress")
+    if max_in_progress is None:
+        max_in_progress = _kbd().inherited_max_in_progress()
+        if max_in_progress is not None:
+            _log_info(
+                "kanban dispatcher: kanban.max_in_progress unset in this profile; "
+                "inheriting %d from the root config", max_in_progress,
+            )
     effective_max_in_progress = _kbd().resolve_max_in_progress(max_in_progress)
-    if max_in_progress is None and effective_max_in_progress is not None:
-        logger.info(
+    if max_in_progress is None:
+        _log_info(
             "kanban dispatcher: kanban.max_in_progress unset; using "
             "memory-derived default max_in_progress=%d "
             "(set kanban.max_in_progress in config.yaml to override)",
@@ -99,7 +129,7 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
     # with existing installs.
     default_assignee = (kanban_cfg.get("default_assignee") or "").strip() or None
     if default_assignee:
-        logger.info("kanban dispatcher: default_assignee=%r (unassigned ready tasks "
+        _log_info("kanban dispatcher: default_assignee=%r (unassigned ready tasks "
                     "will route to this profile)", default_assignee)
 
     return _DispatcherSettings(
@@ -129,10 +159,44 @@ class _KanbanDispatcher:
 
     CORRUPT_BOARD_RETRY_AFTER_SECONDS = 300
 
-    def __init__(self, kb: Any, settings: _DispatcherSettings) -> None:
+    def __init__(self, kb: Any, settings: _DispatcherSettings,
+                 settings_provider: Optional[Callable[[], _DispatcherSettings]] = None) -> None:
         self.kb = kb
         self.settings = settings
+        self._settings_provider = settings_provider
         self.disabled_corrupt_boards: dict[str, tuple[tuple[str, int | None, int | None], float]] = {}
+
+    def refresh_settings(self) -> bool:
+        """Re-resolve ``kanban.*`` knobs from config; True when any of them changed.
+
+        The knobs used to freeze at boot, so lowering ``max_in_progress`` under
+        load required a gateway restart — and the workers are the gateway's
+        children, so that restart killed exactly the workers the new cap was
+        meant to protect. Re-reading per tick makes the YAML authoritative
+        within one interval (``load_config`` is cached on the file signature, so
+        this is a stat plus a parse only when the file changed).
+
+        A provider failure keeps the previous settings: a broken config must not
+        silently widen a running dispatcher's cap.
+        """
+        if self._settings_provider is None:
+            return False
+        try:
+            fresh = self._settings_provider()
+        except Exception:
+            logger.exception("kanban dispatcher: re-reading kanban settings failed; keeping previous values")
+            return False
+        if fresh is None or fresh == self.settings:
+            return False
+        changed = [
+            f"{name}: {getattr(self.settings, name)!r} -> {getattr(fresh, name)!r}"
+            for name in RELOADABLE_SETTINGS
+            if getattr(self.settings, name) != getattr(fresh, name)
+        ]
+        self.settings = fresh
+        if changed:
+            logger.info("kanban dispatcher: kanban settings reloaded from config (%s)", "; ".join(changed))
+        return bool(changed)
 
     def _board_slugs(self) -> list:
         return _board_slugs(self.kb)
@@ -214,7 +278,12 @@ class _KanbanDispatcher:
                     conn.close()
 
     def tick_once(self) -> list[tuple[str, Optional[object]]]:
-        """Run one dispatch_once per board. Returns (slug, result) pairs."""
+        """Run one dispatch_once per board. Returns (slug, result) pairs.
+
+        Settings are re-resolved first so a config edit applies on the next tick
+        instead of needing a gateway restart (which would kill live workers).
+        """
+        self.refresh_settings()
         return [(slug, self.tick_once_for_board(slug)) for slug in self._board_slugs()]
 
     def ready_nonempty(self) -> bool:

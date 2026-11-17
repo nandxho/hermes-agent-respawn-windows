@@ -14,9 +14,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sqlite3
+import subprocess
+import sys
 import time
-from contextlib import closing
+from contextlib import closing, suppress
 from datetime import datetime, timezone, UTC
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -62,8 +65,17 @@ def _proc_fields(path: str, wanted: dict[str, str]) -> dict[str, int]:
 
 
 def sample_memory() -> dict[str, Any]:
-    """Cheap /proc snapshot (KiB): own RSS + MemTotal/MemAvailable + swap used.  Linux-only
-    (``{}`` elsewhere), never raises; the 30s heartbeat embeds it so OOM cycles are classifiable."""
+    """Cheap memory snapshot (KiB): own RSS + total/available + swap used.
+
+    Linux reads procfs (no fork).  Everywhere else — macOS and Windows, where
+    there is no ``/proc`` — falls back to ``host_statistics64`` via psutil and,
+    on macOS without psutil, to ``sysctl hw.memsize`` + ``vm_stat``.  Never
+    raises; ``{}`` only when the box offers no readable sample at all.  The 30s
+    heartbeat embeds it so OOM cycles are classifiable, and the kanban
+    dispatcher derives its pressure level and default concurrency cap from it —
+    an empty sample there meant "unknown" forever on macOS (no pressure guard,
+    no cap).
+    """
     sample = _proc_fields("/proc/self/status", {"VmRSS": "rss_kib"})
     mem = _proc_fields("/proc/meminfo", {"MemTotal": "mem_total_kib", "MemAvailable": "mem_available_kib",
                                          "SwapTotal": "SwapTotal", "SwapFree": "SwapFree"})
@@ -71,7 +83,123 @@ def sample_memory() -> dict[str, Any]:
     sample.update(mem)
     if swap_total is not None and swap_free is not None:
         sample["swap_used_kib"] = swap_total - swap_free
+    if sample.get("mem_total_kib"):
+        return sample
+
+    sample.update(_host_memory_sample())
+    if "rss_kib" not in sample and (rss := _self_rss_kib()) is not None:
+        sample["rss_kib"] = rss
     return sample
+
+
+# ``vm_stat`` header/rows, e.g. ``Mach Virtual Memory Statistics: (page size of 16384 bytes)``
+# and ``Pages free:                            6364.``  Counters are pages, not KiB.
+_VM_STAT_PAGE_SIZE_RE = re.compile(r"page size of (\d+) bytes")
+_VM_STAT_ROW_RE = re.compile(r"^([A-Za-z][^:]*):\s*(\d+)\.?$")
+# ``sysctl -n vm.swapusage`` -> ``total = 27648.00M  used = 26858.12M  free = 789.88M``
+_SWAP_USAGE_RE = re.compile(r"(total|used|free)\s*=\s*([0-9.]+)\s*([KMG])", re.IGNORECASE)
+_SWAP_UNIT_KIB = {"K": 1, "M": 1024, "G": 1024 * 1024}
+
+
+def _run_text(argv: list[str], *, timeout: float = 2.0) -> str:
+    """stdout of a short probe command; ``""`` on any failure (never raises)."""
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return proc.stdout or ""
+
+
+def _parse_vm_stat(text: str) -> dict[str, int]:
+    """``{lowercased counter: pages}`` plus ``page_size`` from ``vm_stat`` output.
+
+    ``Pages free`` is printed as ``free_count - speculative_count``, so callers
+    add inactive + speculative to reach the available figure — the same sum
+    psutil reports for macOS from ``host_statistics64``.
+    """
+    found: dict[str, int] = {}
+    match = _VM_STAT_PAGE_SIZE_RE.search(text or "")
+    if match:
+        found["page_size"] = int(match.group(1))
+    for line in (text or "").splitlines():
+        row = _VM_STAT_ROW_RE.match(line.strip())
+        if row is not None:
+            with suppress(ValueError):
+                found[row.group(1).strip().lower()] = int(row.group(2))
+    return found
+
+
+def _parse_swapusage(text: str) -> dict[str, int]:
+    """``{swap_total_kib, swap_used_kib}`` from ``sysctl -n vm.swapusage`` output."""
+    found: dict[str, int] = {}
+    for key, amount, unit in _SWAP_USAGE_RE.findall(text or ""):
+        try:
+            found[key.lower()] = int(float(amount) * _SWAP_UNIT_KIB[unit.upper()])
+        except (KeyError, ValueError):
+            continue
+    sample: dict[str, int] = {}
+    if "total" in found:
+        sample["swap_total_kib"] = found["total"]
+    if "used" in found:
+        sample["swap_used_kib"] = found["used"]
+    return sample
+
+
+def _darwin_memory_sample() -> dict[str, int]:
+    """macOS sample from ``sysctl -n hw.memsize`` + ``vm_stat`` (+ swap usage).
+
+    Two short-lived probes; the psutil path below is preferred when the
+    extension module is importable, this one keeps sampling alive without it.
+    """
+    try:
+        total_kib = int(_run_text(["sysctl", "-n", "hw.memsize"]).strip()) // 1024
+    except (TypeError, ValueError):
+        return {}
+    if total_kib <= 0:
+        return {}
+    sample: dict[str, int] = {"mem_total_kib": total_kib}
+    counters = _parse_vm_stat(_run_text(["vm_stat"]))
+    page_size = counters.get("page_size") or 4096
+    available_pages = sum(counters.get(key, 0) for key in ("pages free", "pages inactive", "pages speculative"))
+    if available_pages > 0:
+        sample["mem_available_kib"] = min(available_pages * page_size // 1024, total_kib)
+    sample.update(_parse_swapusage(_run_text(["sysctl", "-n", "vm.swapusage"])))
+    return sample
+
+
+def _host_memory_sample() -> dict[str, int]:
+    """Non-procfs memory sample (macOS/Windows): psutil first, ``sysctl``+``vm_stat`` second."""
+    try:
+        import psutil  # local: this module stays importable without the extension
+
+        vm = psutil.virtual_memory()
+        total_kib = int(vm.total) // 1024
+        sample: dict[str, int] = {"mem_total_kib": total_kib, "mem_available_kib": int(vm.available) // 1024}
+        swap = psutil.swap_memory()
+        if int(swap.total) > 0:
+            sample["swap_total_kib"] = int(swap.total) // 1024
+            sample["swap_used_kib"] = int(swap.used) // 1024
+        if sample["mem_total_kib"] > 0:
+            return sample
+    except Exception:
+        pass
+    if sys.platform == "darwin":
+        return _darwin_memory_sample()
+    return {}
+
+
+def _self_rss_kib() -> Optional[int]:
+    """This process's peak RSS in KiB, or None (Darwin reports bytes, Linux KiB)."""
+    try:
+        import resource
+
+        maxrss = int(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+    except Exception:
+        return None
+    if maxrss <= 0:
+        return None
+    return maxrss // 1024 if sys.platform == "darwin" else maxrss
+
 
 
 def _read_json(path: Path) -> Optional[dict[str, Any]]:

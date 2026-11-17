@@ -26,6 +26,7 @@ from gateway.kanban_watchers_common import (
 )
 from gateway.kanban_watchers_notifier import _KanbanNotification, _notifier_collect
 from gateway.kanban_watchers_dispatcher import (
+    _DispatcherSettings,
     _KanbanDispatcher,
     _log_spawn_results,
     _resolve_dispatcher_settings,
@@ -279,7 +280,14 @@ class GatewayKanbanWatchersMixin:
         bad_ticks = 0
         last_warn_at = 0
         results: Optional[list] = None
-        dispatcher = _KanbanDispatcher(_kb, settings)
+
+        def _reload_settings() -> _DispatcherSettings:
+            """Re-resolve dispatch knobs from the current config (per-tick hot reload)."""
+            cfg = _load_config()
+            kcfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+            return _resolve_dispatcher_settings(kcfg, _kb, quiet=True)
+
+        dispatcher = _KanbanDispatcher(_kb, settings, settings_provider=_reload_settings)
 
         logger.info("kanban dispatcher: embedded in gateway (interval=%.1fs)", interval)
         while self._running:
@@ -327,6 +335,8 @@ class GatewayKanbanWatchersMixin:
             except Exception:
                 logger.exception("kanban dispatcher: unexpected watcher error")
 
+            # A reloaded dispatch_interval_seconds applies from the next sleep on.
+            interval = dispatcher.settings.interval
             await self._sleep_between_ticks(interval)
 
         self._release_kanban_dispatcher_lock()

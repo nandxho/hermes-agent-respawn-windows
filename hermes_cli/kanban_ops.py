@@ -69,9 +69,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_in_progress_per_profile = kbd._positive_int(
             _kanban_cfg.get("max_in_progress_per_profile"), None
         )
-        # Memory-derived default when unset — same fallback the gateway applies.
+        # Memory-derived default when unset — same fallback chain the gateway
+        # applies: explicit config, then the root home's value, then derived.
         max_in_progress = kbd.resolve_max_in_progress(
             kbd._positive_int(_kanban_cfg.get("max_in_progress"), None)
+            or kbd.inherited_max_in_progress()
         )
         # CLI --max is the more explicit signal, so it wins over kanban.max_spawn.
         cli_max = getattr(args, "max", None)

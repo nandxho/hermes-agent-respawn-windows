@@ -1833,7 +1833,10 @@ def review_dispatch_enabled() -> bool:
 # safeguards — a memory-DERIVED default cap when none is configured
 # (``resolve_max_in_progress``) and a live memory-PRESSURE guard inside the
 # tick (``_memory_pressure_level``) because a static cap can't see other
-# tenants. Both fail open: non-Linux / read error → no cap / "unknown".
+# tenants. Both must fail CLOSED on "unknown": a host that cannot report its
+# memory (macOS/Windows without a readable sample) is exactly where an
+# unbounded fan-out swap-thrashes it, so "unknown" resolves to the conservative
+# floor rather than to "no cap".
 
 # Assumed per-worker footprint for the derived cap; deliberately conservative
 # so the cap errs toward fewer workers on small VMs.
@@ -1846,11 +1849,14 @@ DERIVED_MAX_IN_PROGRESS_CEILING = 8
 
 
 def _system_memory_sample() -> dict:
-    """Best-effort system memory snapshot (KiB values), ``{}`` when unknown.
+    """Best-effort system memory snapshot (KiB values), ``{}`` only when unreadable.
 
     Local import keeps ``kanban_db`` importable without the gateway package.
     Module-level indirection is also the test seam — conftest patches this to
     ``{}`` so results don't depend on the CI runner's live memory.
+    ``sample_memory()`` itself is cross-platform (procfs on Linux,
+    ``host_statistics64``/``vm_stat`` on macOS), so ``{}`` here means the box
+    cannot report memory at all — not "this platform has no /proc".
     """
     try:
         from gateway.lifecycle_ledger import sample_memory
@@ -1859,49 +1865,117 @@ def _system_memory_sample() -> dict:
         return {}
 
 
-def derive_default_max_in_progress(sample: Optional[Mapping[str, Any]] = None) -> Optional[int]:
+def derive_default_max_in_progress(sample: Optional[Mapping[str, Any]] = None) -> int:
     """Memory-derived default for ``kanban.max_in_progress`` when unset:
-    ``clamp(MemTotal / MEMORY_GUARD_MB_PER_WORKER, FLOOR, CEILING)``. Returns
-    ``None`` (no cap) when total memory is unknown, so macOS/Windows dev
-    machines are unaffected.
+    ``clamp(MemTotal / MEMORY_GUARD_MB_PER_WORKER, FLOOR, CEILING)``.
+
+    Without a usable MemTotal the answer is the FLOOR, never ``None``: an
+    unreadable sample used to mean "no cap at all", which on macOS (no
+    ``/proc``) left every dispatcher unbounded — the opposite of what a memory
+    guard should do when it cannot see memory. Two workers is the conservative
+    floor for a host we can't measure.
     """
     if sample is None:
         sample = _system_memory_sample()
     total_kib = sample.get("mem_total_kib")
     if isinstance(total_kib, bool) or not isinstance(total_kib, int) or total_kib <= 0:
-        return None
+        return DERIVED_MAX_IN_PROGRESS_FLOOR
     workers = (total_kib // 1024) // MEMORY_GUARD_MB_PER_WORKER
     return max(DERIVED_MAX_IN_PROGRESS_FLOOR, min(workers, DERIVED_MAX_IN_PROGRESS_CEILING))
 
 
-def resolve_max_in_progress(configured: Optional[int]) -> Optional[int]:
+def resolve_max_in_progress(configured: Optional[int]) -> int:
     """Effective global concurrency cap: explicit config wins, else the
     memory-derived default. All config-parsing callers route through this so
-    both paths agree.
+    both paths agree, and the answer is always a positive int (``None`` used to
+    mean "uncapped", which no caller can distinguish from a bug).
     """
     if configured is not None:
         return configured
     return derive_default_max_in_progress()
 
 
-def configured_max_in_progress() -> Optional[int]:
-    """Read ``kanban.max_in_progress`` from config, or None when unset/invalid.
-
-    Shared so every dispatch entry point agrees on "explicitly configured": a
-    positive integer wins, anything else falls through to the derived default.
-    """
-    try:
-        from hermes_cli.config import load_config_readonly
-        raw = (load_config_readonly() or {}).get("kanban", {}).get("max_in_progress")
-    except Exception:
-        return None
-    if raw is None:
+def _positive_max_in_progress(raw: Any) -> Optional[int]:
+    """``raw`` as a positive int, or None when unset/invalid (bools rejected)."""
+    if raw is None or isinstance(raw, bool):
         return None
     try:
         ival = int(raw)
     except (TypeError, ValueError):
         return None
     return ival if ival >= 1 else None
+
+
+def inherited_max_in_progress() -> Optional[int]:
+    """``kanban.max_in_progress`` from the ROOT home's config, for a profile home.
+
+    A profile's ``config.yaml`` is loaded on its own (no deep merge with the
+    root's), so a profile that carries a ``kanban:`` section without the key
+    resolved ``None`` — no cap — even though the operator had set a global one.
+    Three profiles ended up unbounded on one host that way. The root value is
+    the operator's declared global intent, so it is the fallback before the
+    memory-derived default.
+
+    Only for NAMED profile homes: the root home is read from its own file, so
+    there is nothing to inherit. Read-only and best-effort — an unreadable root
+    config falls through to the derived cap.
+    """
+    try:
+        from hermes_constants import get_hermes_home, named_profile_home
+
+        profile_home = named_profile_home(get_hermes_home())
+        if profile_home is None:
+            return None
+        from hermes_cli.config_backend import read_config_doc_readonly
+
+        root_doc = read_config_doc_readonly(profile_home.parent.parent / "config.yaml") or {}
+    except Exception:
+        return None
+    if not isinstance(root_doc, dict):
+        return None
+    kanban_cfg = root_doc.get("kanban")
+    if not isinstance(kanban_cfg, dict):
+        return None
+    return _positive_max_in_progress(kanban_cfg.get("max_in_progress"))
+
+
+def configured_max_in_progress() -> Optional[int]:
+    """Read ``kanban.max_in_progress`` from config, or None when unset/invalid.
+
+    Shared so every dispatch entry point agrees on "explicitly configured": a
+    positive integer wins, then the root home's value (profile inheritance — see
+    :func:`inherited_max_in_progress`), anything else falls through to the
+    derived default.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        raw = (load_config_readonly() or {}).get("kanban", {}).get("max_in_progress")
+    except Exception:
+        return None
+    explicit = _positive_max_in_progress(raw)
+    if explicit is not None:
+        return explicit
+    inherited = inherited_max_in_progress()
+    if inherited is not None:
+        _log_inherited_cap(inherited)
+    return inherited
+
+
+_LAST_INHERITED_CAP_LOGGED: Optional[int] = None
+
+
+def _log_inherited_cap(value: int) -> None:
+    """Announce an inherited cap once per value: ``configured_max_in_progress``
+    resolves on every tick and a repeated line would drown the log."""
+    global _LAST_INHERITED_CAP_LOGGED
+    if value == _LAST_INHERITED_CAP_LOGGED:
+        return
+    _LAST_INHERITED_CAP_LOGGED = value
+    with contextlib.suppress(Exception):
+        _kb._log.info(
+            "kanban: this profile's kanban.max_in_progress is unset; "
+            "inheriting the root config value %d", value,
+        )
 
 
 def count_running_tasks(conn: sqlite3.Connection) -> int:
@@ -1962,9 +2036,15 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
     """Classify system memory pressure: ok/elevated/critical/unknown.
 
     Reuses :func:`gateway.memory_status.classify_pressure` so "critical" matches
-    the dashboard banner and lifecycle-ledger OOM heuristics. ``unknown``
-    (non-Linux, read failure) imposes no restriction — never brick dispatch
-    where /proc is unavailable.
+    the dashboard banner and lifecycle-ledger OOM heuristics.
+
+    ``unknown`` (a box whose memory cannot be sampled at all) imposes no
+    pressure restriction, but it is no longer a hole in the guard: the
+    concurrency cap itself never resolves to None anymore, so an unmeasurable
+    host still gets the conservative floor from
+    :func:`derive_default_max_in_progress`. macOS used to land here on every
+    tick because ``sample_memory()`` read procfs only — sample_memory() now
+    falls back to ``host_statistics64``, so Darwin reports a real level.
     """
     if sample is None:
         sample = _system_memory_sample()
